@@ -382,14 +382,3 @@ requestBody:
             type: string
 ```
 
-**Confirmed test result with fixed schema:**
-
-```json
-{
-  "host_alias": "minikube",
-  "message": "Success (OpenAPI validated - FIXED)",
-  "source": "form-data in request body (per FIXED OpenAPI spec)",
-  "user_tags": "env:test"
-}
-```
-
