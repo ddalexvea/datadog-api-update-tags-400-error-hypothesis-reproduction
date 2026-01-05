@@ -8,6 +8,30 @@ A mismatch between **OpenAPI schema validation** and **Flask's request handling*
 - The **frontend** sends parameters as `multipart/form-data` (request body)
 - **Flask's `request.values`** would accept either, but OpenAPI validation rejects the request **before** Flask sees it
 
+## Request Flow
+
+```
+                         REQUEST
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────┐
+│          1. OpenAPI Validation (Connexion)          │
+│                                                     │
+│   • Checks parameters against schema                │
+│   • If FAIL → 400 error (Flask never sees it)       │
+│   • If PASS → continues to Flask                    │
+└─────────────────────────────────────────────────────┘
+                            │
+                     (only if valid)
+                            ▼
+┌─────────────────────────────────────────────────────┐
+│              2. Flask Handler                       │
+│                                                     │
+│   • Business logic                                  │
+│   • Returns response                                │
+└─────────────────────────────────────────────────────┘
+```
+
 ## Real-World Example (Datadog)
 
 This reproduces an issue found in Infrastructure Map vs Host List:
@@ -48,10 +72,12 @@ cat > app.py << 'EOF'
 from flask import Flask, request, jsonify
 import connexion
 
+# Connexion = OpenAPI validation + Flask combined
 app = connexion.FlaskApp(__name__, specification_dir='./')
 app.add_api('openapi.yaml', validate_responses=True)
 flask_app = app.app
 
+# Direct Flask endpoint (no OpenAPI validation)
 @flask_app.route('/direct/update_tags', methods=['POST'])
 def direct_update_tags():
     host_alias = request.values.get('host_alias')
@@ -65,6 +91,7 @@ def direct_update_tags():
         "user_tags": user_tags
     })
 
+# OpenAPI-validated endpoint handler
 def update_tags(host_alias, user_tags=None):
     return {
         "message": "Success (OpenAPI validated)",
@@ -170,26 +197,7 @@ spec:
 EOF
 ```
 
-### 7. Create test.sh
-
-```bash
-cat > test.sh << 'EOF'
-#!/bin/bash
-BASE_URL="${1:-http://localhost:5000}"
-echo "=== TEST 1: OpenAPI + Query Params (✅ Works) ==="
-curl -s -X POST "$BASE_URL/source/update_tags?host_alias=minikube&user_tags=env:test" -H "Content-Type: application/json" -d '{}'
-echo -e "\n\n=== TEST 2: OpenAPI + Form-Data (❌ 400 Error) ==="
-curl -s -X POST "$BASE_URL/source/update_tags" --form "host_alias=minikube" --form "user_tags=env:test"
-echo -e "\n\n=== TEST 3: Direct Flask + Query Params (✅ Works) ==="
-curl -s -X POST "$BASE_URL/direct/update_tags?host_alias=minikube&user_tags=env:test"
-echo -e "\n\n=== TEST 4: Direct Flask + Form-Data (✅ Works) ==="
-curl -s -X POST "$BASE_URL/direct/update_tags" --form "host_alias=minikube" --form "user_tags=env:test"
-echo -e "\n"
-EOF
-chmod +x test.sh
-```
-
-### 8. Build & Deploy to Minikube
+### 7. Build & Deploy
 
 ```bash
 eval $(minikube docker-env)
@@ -198,283 +206,32 @@ kubectl apply -f deployment.yaml
 kubectl wait --for=condition=ready pod -l app=openapi-bug-demo --timeout=60s
 ```
 
-### 9. Test
+### 8. Port-forward & Test
 
 ```bash
 kubectl port-forward svc/openapi-bug-demo 5000:5000 &
 sleep 3
-./test.sh http://localhost:5000
+
+# TEST 1: OpenAPI + Query Params (✅ Works)
+curl -s -X POST 'http://localhost:5000/source/update_tags?host_alias=minikube&user_tags=env:test' \
+  -H "Content-Type: application/json" -d '{}'
+
+# TEST 2: OpenAPI + Form-Data (❌ 400 Error)
+curl -s -X POST 'http://localhost:5000/source/update_tags' \
+  --form "host_alias=minikube" --form "user_tags=env:test"
+
+# TEST 3: Direct Flask + Query Params (✅ Works)
+curl -s -X POST 'http://localhost:5000/direct/update_tags?host_alias=minikube&user_tags=env:test'
+
+# TEST 4: Direct Flask + Form-Data (✅ Works)
+curl -s -X POST 'http://localhost:5000/direct/update_tags' \
+  --form "host_alias=minikube" --form "user_tags=env:test"
 ```
 
-### 10. Cleanup
+### 9. Cleanup
 
 ```bash
 kubectl delete -f deployment.yaml
-```
-
----
-
-## Files
-
-### `app.py`
-
-```python
-"""
-Reproduction of OpenAPI vs Flask form-data bug.
-
-Flask accepts both query params and form-data via request.values,
-but OpenAPI validation only allows what's defined in the spec (query params).
-"""
-from flask import Flask, request, jsonify
-import connexion
-
-# Create Connexion app (Flask + OpenAPI validation)
-app = connexion.FlaskApp(__name__, specification_dir='./')
-app.add_api('openapi.yaml', validate_responses=True)
-
-# Get the underlying Flask app for direct routes (no OpenAPI validation)
-flask_app = app.app
-
-
-@flask_app.route('/direct/update_tags', methods=['POST'])
-def direct_update_tags():
-    """
-    Direct Flask endpoint - NO OpenAPI validation.
-    Uses request.values which accepts BOTH query params AND form-data.
-    """
-    host_alias = request.values.get('host_alias')
-    user_tags = request.values.get('user_tags', '')
-    
-    if not host_alias:
-        return jsonify({"error": "Missing host_alias parameter"}), 400
-    
-    return jsonify({
-        "message": "Success (direct Flask - no OpenAPI)",
-        "source": "request.values (query OR form-data)",
-        "host_alias": host_alias,
-        "user_tags": user_tags
-    })
-
-
-# OpenAPI-validated endpoint is defined in openapi.yaml and handled below
-def update_tags(host_alias, user_tags=None):
-    """
-    OpenAPI-validated endpoint handler.
-    Parameters come from OpenAPI validation layer.
-    """
-    return {
-        "message": "Success (OpenAPI validated)",
-        "source": "query params only (per OpenAPI spec)",
-        "host_alias": host_alias,
-        "user_tags": user_tags or ""
-    }
-
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
-```
-
----
-
-### `openapi.yaml`
-
-```yaml
-openapi: 3.0.0
-info:
-  title: OpenAPI Form-Data Bug Reproduction
-  description: |
-    Demonstrates the mismatch between OpenAPI validation and Flask's request.values.
-    
-    The /source/update_tags endpoint requires host_alias as a QUERY parameter.
-    Sending it in form-data body will fail OpenAPI validation, even though
-    Flask's request.values would accept it.
-  version: 1.0.0
-
-paths:
-  /source/update_tags:
-    post:
-      operationId: app.update_tags
-      summary: Update host tags (OpenAPI validated)
-      description: |
-        This endpoint requires host_alias as a QUERY parameter.
-        Form-data in the body will be rejected by OpenAPI validation.
-      parameters:
-        - name: host_alias
-          in: query
-          required: true
-          description: The host alias to update tags for
-          schema:
-            type: string
-        - name: user_tags
-          in: query
-          required: false
-          description: Comma-separated list of tags
-          schema:
-            type: string
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                _authentication_token:
-                  type: string
-      responses:
-        '200':
-          description: Success
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  message:
-                    type: string
-                  host_alias:
-                    type: string
-                  user_tags:
-                    type: string
-        '400':
-          description: Bad Request - Missing required parameter
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status:
-                    type: integer
-                  title:
-                    type: string
-                  detail:
-                    type: string
-```
-
----
-
-### `requirements.txt`
-
-```
-flask==3.0.0
-connexion[flask,swagger-ui,uvicorn]==3.0.5
-```
-
----
-
-### `Dockerfile`
-
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY app.py openapi.yaml ./
-
-EXPOSE 5000
-
-CMD ["python", "app.py"]
-```
-
----
-
-### `deployment.yaml`
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: openapi-bug-demo
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: openapi-bug-demo
-  template:
-    metadata:
-      labels:
-        app: openapi-bug-demo
-    spec:
-      containers:
-      - name: app
-        image: openapi-bug-demo:latest
-        imagePullPolicy: Never
-        ports:
-        - containerPort: 5000
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: openapi-bug-demo
-spec:
-  type: NodePort
-  selector:
-    app: openapi-bug-demo
-  ports:
-  - port: 5000
-    targetPort: 5000
-    nodePort: 30500
-```
-
----
-
-### `test.sh`
-
-```bash
-#!/bin/bash
-
-BASE_URL="${1:-http://localhost:5000}"
-
-echo "=========================================="
-echo "OpenAPI vs Form-Data Bug Reproduction"
-echo "=========================================="
-echo ""
-echo "Testing against: $BASE_URL"
-echo ""
-
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 1: OpenAPI endpoint + Query Params (✅ Works)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-curl -s -X POST "$BASE_URL/source/update_tags?host_alias=minikube&user_tags=env:test" \
-  -H "Content-Type: application/json" -d '{}'
-echo -e "\n"
-
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 2: OpenAPI endpoint + Form-Data (❌ 400 Error)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-curl -s -X POST "$BASE_URL/source/update_tags" \
-  --form "host_alias=minikube" \
-  --form "user_tags=env:test"
-echo -e "\n"
-
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 3: Direct Flask + Query Params (✅ Works)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-curl -s -X POST "$BASE_URL/direct/update_tags?host_alias=minikube&user_tags=env:test"
-echo -e "\n"
-
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "TEST 4: Direct Flask + Form-Data (✅ Works)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-curl -s -X POST "$BASE_URL/direct/update_tags" \
-  --form "host_alias=minikube" \
-  --form "user_tags=env:test"
-echo -e "\n"
-
-echo "=========================================="
-echo "SUMMARY"
-echo "=========================================="
-echo ""
-echo "┌─────────────────────┬──────────────┬─────────────┐"
-echo "│ Endpoint            │ Query Params │ Form-Data   │"
-echo "├─────────────────────┼──────────────┼─────────────┤"
-echo "│ /source/update_tags │ ✅ Works     │ ❌ Rejected │"
-echo "│ (OpenAPI validated) │              │             │"
-echo "├─────────────────────┼──────────────┼─────────────┤"
-echo "│ /direct/update_tags │ ✅ Works     │ ✅ Works    │"
-echo "│ (Flask only)        │              │             │"
-echo "└─────────────────────┴──────────────┴─────────────┘"
 ```
 
 ---
@@ -488,7 +245,6 @@ curl -X POST 'http://localhost:5000/source/update_tags?host_alias=minikube&user_
   -H "Content-Type: application/json" -d '{}'
 ```
 
-**Result:** ✅ Success
 ```json
 {
   "host_alias": "minikube",
@@ -502,11 +258,9 @@ curl -X POST 'http://localhost:5000/source/update_tags?host_alias=minikube&user_
 
 ```bash
 curl -X POST 'http://localhost:5000/source/update_tags' \
-  --form "host_alias=minikube" \
-  --form "user_tags=env:test"
+  --form "host_alias=minikube" --form "user_tags=env:test"
 ```
 
-**Result:** ❌ 400 Error
 ```json
 {"type": "about:blank", "title": "Bad Request", "detail": "Missing query parameter 'host_alias'", "status": 400}
 ```
@@ -517,7 +271,6 @@ curl -X POST 'http://localhost:5000/source/update_tags' \
 curl -X POST 'http://localhost:5000/direct/update_tags?host_alias=minikube&user_tags=env:test'
 ```
 
-**Result:** ✅ Success
 ```json
 {
   "host_alias": "minikube",
@@ -531,11 +284,9 @@ curl -X POST 'http://localhost:5000/direct/update_tags?host_alias=minikube&user_
 
 ```bash
 curl -X POST 'http://localhost:5000/direct/update_tags' \
-  --form "host_alias=minikube" \
-  --form "user_tags=env:test"
+  --form "host_alias=minikube" --form "user_tags=env:test"
 ```
 
-**Result:** ✅ Success
 ```json
 {
   "host_alias": "minikube",
@@ -605,7 +356,7 @@ HttpPOST('/source/update_tags', { type: 'formdata' })({ host_alias, user_tags })
 HttpPOST(`/source/update_tags?host_alias=${host_alias}&user_tags=${user_tags}`)({});
 ```
 
-### Option 2: Update OpenAPI Schema
+### Option 2: Update OpenAPI Schema ✅ TESTED
 
 Change the schema to accept parameters in the request body:
 
@@ -617,12 +368,28 @@ parameters:
 
 # After (accepts form-data)
 requestBody:
+  required: true
   content:
     multipart/form-data:
       schema:
+        type: object
+        required:
+          - host_alias
         properties:
           host_alias:
             type: string
           user_tags:
             type: string
 ```
+
+**Confirmed test result with fixed schema:**
+
+```json
+{
+  "host_alias": "minikube",
+  "message": "Success (OpenAPI validated - FIXED)",
+  "source": "form-data in request body (per FIXED OpenAPI spec)",
+  "user_tags": "env:test"
+}
+```
+
